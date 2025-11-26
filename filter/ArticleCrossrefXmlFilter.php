@@ -20,9 +20,12 @@ use APP\author\Author;
 use APP\core\Application;
 use APP\facades\Repo;
 use APP\plugins\generic\crossref\CrossrefExportDeployment;
+use APP\publication\enums\VersionStage;
+use APP\publication\Publication;
 use APP\submission\Submission;
 use DOMDocument;
 use DOMElement;
+use PKP\context\Context;
 use PKP\core\PKPApplication;
 use PKP\db\DAORegistry;
 use PKP\filter\FilterGroup;
@@ -50,10 +53,52 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
      */
     public function createJournalNode($doc, $pubObject)
     {
+        /** @var CrossrefExportDeployment $deployment */
         $deployment = $this->getDeployment();
+        $context = $deployment->getContext();
+
         $journalNode = parent::createJournalNode($doc, $pubObject);
         assert($pubObject instanceof Submission);
-        $journalNode->appendChild($this->createJournalArticleNode($doc, $pubObject));
+
+        if (!$context->getData(Context::SETTING_DOI_VERSIONING)) {
+            $publication = $pubObject->getCurrentPublication();
+            $journalNode->appendChild($this->createJournalArticleNode($doc, $publication, $pubObject, [], []));
+            return $journalNode;
+        }
+        // DOI versioning
+        $publications = $pubObject->getData('publications')->toArray();
+        $latestMinorPublications = [];
+        foreach ($publications as $publication) {
+            $versionStage = $publication->getData('versionStage');
+            $versionMajor = $publication->getData('versionMajor');
+            $versionMinor = $publication->getData('versionMinor');
+            if (!array_key_exists($versionStage, $latestMinorPublications)) {
+                $latestMinorPublications[$versionStage] = [];
+            }
+            if (!array_key_exists($versionMajor, $latestMinorPublications[$versionStage])) {
+                // add the publication
+                $latestMinorPublications[$versionStage][$versionMajor] = $publication;
+                continue;
+            }
+            if ($versionMinor > $latestMinorPublications[$versionStage][$versionMajor]->getData('versionMinor')) {
+                $latestMinorPublications[$versionStage][$versionMajor] = $publication;
+            }
+        }
+
+        $preprints = $versions = [];
+        foreach ($latestMinorPublications as $versionStage) {
+            foreach ($versionStage as $publication) {
+                if ($publication->getDoi() && $publication->getData('status') === Publication::STATUS_PUBLISHED) {
+                    if ($publication->getData('versionStage') == VersionStage::AUTHOR_ORIGINAL->value) {
+                        //$journalNode->appendChild($this->createPostedContentNode($doc, $publication, $pubObject));
+                        $preprints[] = $publication->getDoi();
+                    } else {
+                        $journalNode->appendChild($this->createJournalArticleNode($doc, $publication, $pubObject, $preprints, $versions));
+                        $versions[] = $publication->getDoi();
+                    }
+                }
+            }
+        }
         return $journalNode;
     }
 
@@ -72,7 +117,7 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
         $context = $deployment->getContext();
         $cache = $deployment->getCache();
         assert($submission instanceof Submission);
-        
+
         $issueId = $submission->getCurrentPublication()->getData('issueId');
 
         if (!$issueId) {
@@ -93,30 +138,21 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
 
     /**
      * Create and return the journal article node 'journal_article'.
-     *
-     * @param DOMDocument $doc
-     * @param Submission $submission
-     *
-     * @return DOMElement
      */
-    public function createJournalArticleNode($doc, $submission)
+    public function createJournalArticleNode(DOMDocument $doc, Publication $publication, Submission $submission, array $preprints, array $versions): DOMElement
     {
         /** @var CrossrefExportDeployment $deployment */
         $deployment = $this->getDeployment();
         $context = $deployment->getContext();
         $request = Application::get()->getRequest();
 
-        $publication = $submission->getCurrentPublication();
         $locale = $publication->getData('locale');
-
-        // Issue should be set by now
-        $issue = $deployment->getIssue();
 
         $journalArticleNode = $doc->createElementNS($deployment->getNamespace(), 'journal_article');
         $journalArticleNode->setAttribute('publication_type', 'full_text');
         $journalArticleNode->setAttribute('language', \Locale::getPrimaryLanguage($locale));
 
-        // title
+        // titles
         $titleLanguages = array_keys($publication->getTitles());
         // Crossref 5.3.1 limits to 20 titles maximum, ensure the primary locale is first
         $primaryLanguageIndex = array_search($locale, $titleLanguages);
@@ -223,7 +259,7 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
             $journalArticleNode->appendChild($contributorsNode);
         }
 
-        // abstract
+        // jats:abstract
         $abstracts = $publication->getData('abstract') ?: [];
         foreach ($abstracts as $lang => $abstract) {
             $abstractNode = $doc->createElementNS($deployment->getJATSNamespace(), 'jats:abstract');
@@ -232,10 +268,12 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
             $journalArticleNode->appendChild($abstractNode);
         }
 
-        // publication date
+        // publication_date
         if ($datePublished = $publication->getData('datePublished')) {
             $journalArticleNode->appendChild($this->createPublicationDateNode($doc, $datePublished));
         }
+
+        // acceptance_date ???
 
         // pages
         // Crossref requires first_page and last_page of any contiguous range, then any other ranges go in other_pages
@@ -268,6 +306,7 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
             }
         }
 
+        // ai:program
         // license
         if ($publication->getData('licenseUrl')) {
             $licenseNode = $doc->createElementNS($deployment->getAINamespace(), 'ai:program');
@@ -276,11 +315,17 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
             $journalArticleNode->appendChild($licenseNode);
         }
 
-        // DOI data
+        // rel:program
+        if (!empty($preprints) || !empty($versions)) {
+            $journalArticleNode->appendChild($this->createRelationships($doc, $preprints, $versions));
+        }
+
+        // doi_data
         $dispatcher = $this->_getDispatcher($request);
         $url = $dispatcher->url($request, PKPApplication::ROUTE_PAGE, $context->getPath(), 'article', 'view', [$publication->getData('urlPath') ?? $submission->getId()], null, null, true, '');
         $doiDataNode = $this->createDOIDataNode($doc, $publication->getDoi(), $url);
-        // append galleys files and collection nodes to the DOI data node
+
+        // Append galleys files and collection nodes to the DOI data node
         $galleys = $publication->getData('galleys');
         // All full-texts, PDF full-texts and remote galleys for text-mining and as-crawled URL
         $submissionGalleys = $pdfGalleys = $remoteGalleys = [];
@@ -324,15 +369,15 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
             $asCrawledGalleys = $submissionGalleys;
         }
         // as-crawled URL - collection nodes
-        $this->appendAsCrawledCollectionNodes($doc, $doiDataNode, $submission, $asCrawledGalleys);
+        $this->appendAsCrawledCollectionNodes($doc, $doiDataNode, $publication, $submission, $asCrawledGalleys);
         // text-mining - collection nodes
         $submissionGalleys = array_merge($submissionGalleys, $remoteGalleys);
-        $this->appendTextMiningCollectionNodes($doc, $doiDataNode, $submission, $submissionGalleys);
+        $this->appendTextMiningCollectionNodes($doc, $doiDataNode, $publication, $submission, $submissionGalleys);
         $journalArticleNode->appendChild($doiDataNode);
 
-        // component list (supplementary files)
+        // component_list (supplementary files)
         if (!empty($componentGalleys)) {
-            $journalArticleNode->appendChild($this->createComponentListNode($doc, $submission, $componentGalleys));
+            $journalArticleNode->appendChild($this->createComponentListNode($doc, $publication, $submission, $componentGalleys));
         }
 
         return $journalArticleNode;
@@ -340,18 +385,13 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
 
     /**
      * Append the collection node 'collection property="crawler-based"' to the doi data node.
-     *
-     * @param DOMDocument $doc
-     * @param DOMElement $doiDataNode
-     * @param Submission $submission
-     * @param array $galleys of \PKP\galley\Galley objects
      */
-    public function appendAsCrawledCollectionNodes($doc, $doiDataNode, $submission, $galleys)
+    public function appendAsCrawledCollectionNodes(DOMDocument $doc, DOMElement $doiDataNode, Publication $publication, Submission $submission, array $galleys): void
     {
+        /** @var CrossrefExportDeployment $deployment */
         $deployment = $this->getDeployment();
         $context = $deployment->getContext();
         $request = Application::get()->getRequest();
-        $publication = $submission->getCurrentPublication();
         $dispatcher = $this->_getDispatcher($request);
 
         if (empty($galleys)) {
@@ -374,19 +414,14 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
 
     /**
      * Append the collection node 'collection property="text-mining"' to the doi data node.
-     *
-     * @param DOMDocument $doc
-     * @param DOMElement $doiDataNode
-     * @param Submission $submission
-     * @param array $galleys of \PKP\galley\Galley objects
      */
-    public function appendTextMiningCollectionNodes($doc, $doiDataNode, $submission, $galleys)
+    public function appendTextMiningCollectionNodes(DOMDocument $doc, DOMElement $doiDataNode, Publication $publication, Submission $submission, array $galleys): void
     {
+        /** @var CrossrefExportDeployment $deployment */
         $deployment = $this->getDeployment();
         $context = $deployment->getContext();
         $request = Application::get()->getRequest();
         $dispatcher = $this->_getDispatcher($request);
-        $publication = $submission->getCurrentPublication();
 
         // Check if there is at least one galley that is NOT audio or video
         $hasTextMiningCandidate = false;
@@ -429,19 +464,13 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
 
     /**
      * Create and return component list node 'component_list'.
-     *
-     * @param DOMDocument $doc
-     * @param Submission $submission
-     * @param array $componentGalleys
-     *
-     * @return DOMElement
      */
-    public function createComponentListNode($doc, $submission, $componentGalleys)
+    public function createComponentListNode(DOMDocument $doc, Publication $publication, Submission $submission, array $componentGalleys): DOMElement
     {
+        /** @var CrossrefExportDeployment $deployment */
         $deployment = $this->getDeployment();
         $context = $deployment->getContext();
         $request = Application::get()->getRequest();
-        $publication = $submission->getCurrentPublication();
         $dispatcher = $this->_getDispatcher($request);
 
         // Create the base node
@@ -464,5 +493,30 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
             $componentListNode->appendChild($componentNode);
         }
         return $componentListNode;
+    }
+
+    public function createRelationships($doc, $preprints, $versions): DOMElement
+    {
+        /** @var CrossrefExportDeployment $deployment */
+        $deployment = $this->getDeployment();
+
+        $programNode = $doc->createElementNS($deployment->getRelNamespace(), 'rel:program');
+        foreach ($preprints as $preprintDoi) {
+            $relatedItemNode = $doc->createElementNS($deployment->getRelNamespace(), 'rel:related_item');
+            $intraWorkRel = $doc->createElementNS($deployment->getRelNamespace(), 'rel:intra_work_relation', htmlspecialchars($preprintDoi, ENT_COMPAT, 'UTF-8'));
+            $intraWorkRel->setAttribute('relationship-type', 'hasPreprint');
+            $intraWorkRel->setAttribute('identifier-type', 'doi');
+            $relatedItemNode->appendChild($intraWorkRel);
+            $programNode->appendChild($relatedItemNode);
+        }
+        foreach ($versions as $versionDoi) {
+            $relatedItemNode = $doc->createElementNS($deployment->getRelNamespace(), 'rel:related_item');
+            $intraWorkRel = $doc->createElementNS($deployment->getRelNamespace(), 'rel:intra_work_relation', htmlspecialchars($versionDoi, ENT_COMPAT, 'UTF-8'));
+            $intraWorkRel->setAttribute('relationship-type', 'isVersionOf');
+            $intraWorkRel->setAttribute('identifier-type', 'doi');
+            $relatedItemNode->appendChild($intraWorkRel);
+            $programNode->appendChild($relatedItemNode);
+        }
+        return $programNode;
     }
 }
