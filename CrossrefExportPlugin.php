@@ -21,11 +21,14 @@ use APP\issue\Issue;
 use APP\journal\Journal;
 use APP\plugins\DOIPubIdExportPlugin;
 use APP\plugins\IDoiRegistrationAgency;
+use APP\publication\enums\VersionStage;
+use APP\publication\Publication;
 use APP\submission\Submission;
 use Exception;
 use GuzzleHttp\Exception\GuzzleException;
 use GuzzleHttp\Exception\RequestException;
 use PKP\config\Config;
+use PKP\context\Context;
 use PKP\core\DataObject;
 use PKP\doi\Doi;
 use PKP\file\FileManager;
@@ -98,6 +101,14 @@ class CrossrefExportPlugin extends DOIPubIdExportPlugin
     public function getSubmissionFilter()
     {
         return 'article=>crossref-xml';
+    }
+
+    /**
+     * Get the posted_content i.e. preprint filter.
+     */
+    public function getPreprintFilter(): string
+    {
+        return 'preprint=>crossref-xml';
     }
 
     /**
@@ -197,12 +208,16 @@ class CrossrefExportPlugin extends DOIPubIdExportPlugin
         return (string) \APP\plugins\generic\crossref\CrossrefExportDeployment::class;
     }
 
-    public function exportAndDeposit($context, $objects, $filter, string &$responseMessage, $noValidation = null): bool
+    /**
+     * Exports and deposits XML
+     *
+     * @param Submission[] $submissions
+     */
+    public function exportSubmissionsAndDeposit(Context $context, array $submissions, string &$responseMessage, ?bool $noValidation = null): bool
     {
         $fileManager = new FileManager();
         $resultErrors = [];
 
-        assert($filter != null);
         // Errors occurred will be accessible via the status link
         // thus do not display all errors notifications (for every article),
         // just one general.
@@ -214,18 +229,98 @@ class CrossrefExportPlugin extends DOIPubIdExportPlugin
         // also the filter expects an array of objects.
         // Thus the foreach loop, but every object will be in an one item array for
         // the export and filter to work.
-        foreach ($objects as $object) {
+        foreach ($submissions as $submission) {
             // Get the XML
             // Supply an exportErrors array because otherwise exportXML() will echo out export errors
             $exportErrors = [];
-            $exportXml = $this->exportXML([$object], $filter, $context, $noValidation, $exportErrors);
+            if ($this->preprintsExists([$submission], $context)) {
+                $preprintFilterName = $this->getPreprintFilter();
+                $exportXml = $this->exportXML([$submission], $preprintFilterName, $context, $noValidation, $exportErrors);
+                // Write the XML to a file.
+                // export file name example: crossref-20160723-160036-preprints-1-1.xml
+                $submissionFileNamePart = 'preprints-' . $submission->getId();
+                $exportFileName = $this->getExportFileName($this->getExportPath(), $submissionFileNamePart, $context, '.xml');
+                $fileManager->writeFile($exportFileName, $exportXml);
+                //$result = $this->depositXML($submission, $context, $exportFileName);
+                $result = true;
+                if (!$result) {
+                    $errorsOccurred = true;
+                }
+                if (is_array($result)) {
+                    $resultErrors[] = $result;
+                }
+                // Remove all temporary files.
+                $fileManager->deleteByPath($exportFileName);
+            }
+            if (!$errorsOccurred && empty($resultErrors) && $this->articlesExists([$submission], $context)) {
+                $articleFilterName = $this->getSubmissionFilter();
+                $exportXml = $this->exportXML([$submission], $articleFilterName, $context, $noValidation, $exportErrors);
+                // Write the XML to a file.
+                // export file name example: crossref-20160723-160036-articles-1-1.xml
+                $articles = 'articles-' . $submission->getId();
+                $exportFileName = $this->getExportFileName($this->getExportPath(), $articles, $context, '.xml');
+                $fileManager->writeFile($exportFileName, $exportXml);
+                //$result = $this->depositXML($submission, $context, $exportFileName);
+                $result = true;
+                if (!$result) {
+                    $errorsOccurred = true;
+                }
+                if (is_array($result)) {
+                    $resultErrors[] = $result;
+                }
+                // Remove all temporary files.
+                $fileManager->deleteByPath($exportFileName);
+            }
+        }
+        // Prepare response message and return status
+        if (empty($resultErrors)) {
+            if ($errorsOccurred) {
+                $responseMessage = 'plugins.importexport.crossref.register.error.mdsError';
+                return false;
+            } else {
+                $responseMessage = $this->getDepositSuccessNotificationMessageKey();
+                return true;
+            }
+        } else {
+            $responseMessage = 'api.dois.400.depositFailed';
+            return false;
+        }
+    }
+
+    /**
+     * Exports and deposits XML
+     *
+     * @param Issue[] $issues
+     */
+    public function exportIssuesAndDeposit(Context $context, array $issues, string &$responseMessage, ?bool $noValidation = null): bool
+    {
+        $fileManager = new FileManager();
+        $resultErrors = [];
+
+        $issueFilterName = $this->getIssueFilter();
+        // Errors occurred will be accessible via the status link
+        // thus do not display all errors notifications (for every article),
+        // just one general.
+        // Warnings occurred when the registration was successful will however be
+        // displayed for each article.
+        $errorsOccurred = false;
+        // The new Crossref deposit API expects one request per object.
+        // On contrary the export supports bulk/batch object export, thus
+        // also the filter expects an array of objects.
+        // Thus the foreach loop, but every object will be in an one item array for
+        // the export and filter to work.
+        foreach ($issues as $issue) {
+            // Get the XML
+            // Supply an exportErrors array because otherwise exportXML() will echo out export errors
+            $exportErrors = [];
+            $exportXml = $this->exportXML([$issue], $issueFilterName, $context, $noValidation, $exportErrors);
             // Write the XML to a file.
             // export file name example: crossref-20160723-160036-articles-1-1.xml
-            $objectFileNamePart = $this->_getObjectFileNamePart($object);
-            $exportFileName = $this->getExportFileName($this->getExportPath(), $objectFileNamePart, $context, '.xml');
+            $issueFileNamePart = 'issues-' . $issue->getId();
+            $exportFileName = $this->getExportFileName($this->getExportPath(), $issueFileNamePart, $context, '.xml');
             $fileManager->writeFile($exportFileName, $exportXml);
             // Deposit the XML file.
-            $result = $this->depositXML($object, $context, $exportFileName);
+            $result = $this->depositXML($issue, $context, $exportFileName);
             if (!$result) {
                 $errorsOccurred = true;
             }
@@ -253,22 +348,64 @@ class CrossrefExportPlugin extends DOIPubIdExportPlugin
     /**
      * Exports and stores XML as a TemporaryFile
      *
-     *
-     * @throws Exception
+     * @param Submission[] $submissions
      */
-    public function exportAsDownload(\PKP\context\Context $context, array $objects, string $filter, string $objectsFileNamePart, ?bool $noValidation = null, ?array &$exportErrors = null): ?int
+    public function exportSubmissionsAsDownload(Context $context, array $submissions, ?bool $noValidation = null, ?array &$exportErrors = null): ?int
     {
         $fileManager = new TemporaryFileManager();
 
-        $exportErrors = [];
-        $exportXml = $this->exportXML($objects, $filter, $context, $noValidation, $exportErrors);
-
-        $exportFileName = $this->getExportFileName($this->getExportPath(), $objectsFileNamePart, $context, '.xml');
-
-        $fileManager->writeFile($exportFileName, $exportXml);
-
+        $exportedFiles = [];
+        if ($this->preprintsExists($submissions, $context)) {
+            $preprintFilterName = $this->getPreprintFilter();
+            $exportErrors = [];
+            $exportXml = $this->exportXML($submissions, $preprintFilterName, $context, $noValidation, $exportErrors);
+            $exportFileName = $this->getExportFileName($this->getExportPath(), 'preprints', $context, '.xml');
+            $fileManager->writeFile($exportFileName, $exportXml);
+            $exportedFiles[] = $exportFileName;
+        }
+        if ($this->articlesExists($submissions, $context)) {
+            $journalArticleFilterName = $this->getSubmissionFilter();
+            $exportErrors = [];
+            $exportXml = $this->exportXML($submissions, $journalArticleFilterName, $context, $noValidation, $exportErrors);
+            $exportFileName = $this->getExportFileName($this->getExportPath(), 'articles', $context, '.xml');
+            $fileManager->writeFile($exportFileName, $exportXml);
+            $exportedFiles[] = $exportFileName;
+        }
+        if (count($exportedFiles) > 1) {
+            // tar file name: e.g. datacite-20160723-160036-articles-1.tar.gz
+            $finalExportFileName = $this->getExportFileName(
+                $this->getExportPath(),
+                'articles',
+                $context,
+                '.tar.gz'
+            );
+            $this->tarFiles($this->getExportPath(), $finalExportFileName, $exportedFiles);
+            // remove files
+            foreach ($exportedFiles as $exportedFile) {
+                $fileManager->deleteByPath($exportedFile);
+            }
+        } else {
+            $finalExportFileName = array_shift($exportedFiles);
+        }
         $user = Application::get()->getRequest()->getUser();
 
+        return $fileManager->createTempFileFromExisting($finalExportFileName, $user->getId());
+    }
+
+    /**
+     * Exports and stores XML as a TemporaryFile
+     *
+     * @param Issue[] $issues
+     */
+    public function exportIssuesAsDownload(Context $context, array $issues, ?bool $noValidation = null, ?array &$exportErrors = null): ?int
+    {
+        $fileManager = new TemporaryFileManager();
+        $issueFilterName = $this->getIssueFilter();
+        $exportErrors = [];
+        $exportXml = $this->exportXML($issues, $issueFilterName, $context, $noValidation, $exportErrors);
+        $exportFileName = $this->getExportFileName($this->getExportPath(), 'issues', $context, '.xml');
+        $fileManager->writeFile($exportFileName, $exportXml);
+        $user = Application::get()->getRequest()->getUser();
         return $fileManager->createTempFileFromExisting($exportFileName, $user->getId());
     }
 
@@ -391,17 +528,9 @@ class CrossrefExportPlugin extends DOIPubIdExportPlugin
 
     /**
      * Check the Crossref APIs, if deposits and registration have been successful
-     *
-     * @param Journal $context
-     * @param DataObject $object The object getting deposited
-     * @param int $status
-     * @param string $batchId
-     * @param string $failedMsg (optional)
-     * @param null|mixed $successMsg
      */
-    public function updateDepositStatus($context, $object, $status, $batchId = null, $failedMsg = null, $successMsg = null)
+    public function updateDepositStatus(Context $context, Issue|Submission $object, int $status, ?string $batchId = null, ?string $failedMsg = null, ?string $successMsg = null)
     {
-        assert($object instanceof Submission || $object instanceof Issue);
         if ($object instanceof Submission) {
             $doiIds = Repo::doi()->getDoisForSubmission($object->getId());
         } else {
@@ -427,14 +556,11 @@ class CrossrefExportPlugin extends DOIPubIdExportPlugin
         }
     }
 
-
     /**
      * Get deposit batch ID setting name.
      * NB Changed as of 3.4
-     *
-     * @return string
      */
-    public function getDepositBatchIdSettingName()
+    public function getDepositBatchIdSettingName(): string
     {
         return $this->getPluginSettingsPrefix() . '_batchId';
     }
@@ -442,28 +568,5 @@ class CrossrefExportPlugin extends DOIPubIdExportPlugin
     public function getSuccessMsgSettingName(): string
     {
         return $this->getPluginSettingsPrefix() . '_successMsg';
-    }
-
-    /**
-     * @copydoc PubObjectsExportPlugin::getDepositSuccessNotificationMessageKey()
-     */
-    public function getDepositSuccessNotificationMessageKey()
-    {
-        return 'plugins.importexport.common.register.success';
-    }
-
-    /**
-     * @param Submission|Issue $object
-     *
-     */
-    private function _getObjectFileNamePart(DataObject $object): string
-    {
-        if ($object instanceof Submission) {
-            return 'articles-' . $object->getId();
-        } elseif ($object instanceof Issue) {
-            return 'issues-' . $object->getId();
-        } else {
-            return '';
-        }
     }
 }

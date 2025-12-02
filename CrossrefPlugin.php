@@ -67,6 +67,8 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
             PluginRegistry::register('importexport', new CrossrefExportPlugin($this), $this->getPluginPath());
             $this->_exportPlugin = PluginRegistry::getPlugin('importexport', 'CrossrefExportPlugin');
 
+            Hook::add('Schema::get::doi', $this->addToSchema(...));
+
             if ($this->getEnabled($mainContextId)) {
                 $this->_pluginInitialization();
             }
@@ -103,7 +105,6 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
         Hook::add('DoiSettingsForm::setEnabledRegistrationAgencies', $this->addAsRegistrationAgencyOption(...));
         Hook::add('DoiSetupSettingsForm::getObjectTypes', $this->addAllowedObjectTypes(...));
         Hook::add('Context::validate', $this->validateAllowedPubObjectTypes(...));
-        Hook::add('Schema::get::doi', $this->addToSchema(...));
 
         Hook::add('Doi::markRegistered', $this->editMarkRegisteredParams(...));
         Hook::add('DoiListPanel::setConfig', $this->addRegistrationAgencyName(...));
@@ -160,7 +161,7 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
     public function addRegistrationAgencyName(string $hookName, array $args): bool
     {
         $config = &$args[0];
-        $config['registrationAgencyNames'][$this->_getExportPlugin()->getName()] = $this->getRegistrationAgencyName();
+        $config['registrationAgencyNames'][$this->_exportPlugin->getName()] = $this->getRegistrationAgencyName();
 
         return HOOK::CONTINUE;
     }
@@ -224,7 +225,6 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
 
     /**
      * Checks if plugin meets registration agency-specific requirements for being active and handling deposits
-     *
      */
     public function isPluginConfigured(Context $context): bool
     {
@@ -267,12 +267,8 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
      */
     public function exportSubmissions(array $submissions, Context $context): array
     {
-        // Get filter and set objectsFileNamePart (see: PubObjectsExportPlugin::prepareAndExportPubObjects)
-        $exportPlugin = $this->_getExportPlugin();
-        $filterName = $exportPlugin->getSubmissionFilter();
         $xmlErrors = [];
-
-        $temporaryFileId = $exportPlugin->exportAsDownload($context, $submissions, $filterName, 'articles', null, $xmlErrors);
+        $temporaryFileId = $this->_exportPlugin->exportSubmissionsAsDownload($context, $submissions, null, $xmlErrors);
         return ['temporaryFileId' => $temporaryFileId, 'xmlErrors' => $xmlErrors];
     }
 
@@ -281,11 +277,8 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
      */
     public function depositSubmissions(array $submissions, Context $context): array
     {
-        $exportPlugin = $this->_getExportPlugin();
-        $filterName = $exportPlugin->getSubmissionFilter();
         $responseMessage = '';
-        $status = $exportPlugin->exportAndDeposit($context, $submissions, $filterName, $responseMessage);
-
+        $status = $this->_exportPlugin->exportSubmissionsAndDeposit($context, $submissions, $responseMessage);
         return [
             'hasErrors' => !$status,
             'responseMessage' => $responseMessage
@@ -298,12 +291,8 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
      */
     public function exportIssues(array $issues, Context $context): array
     {
-        // Get filter and set objectsFileNamePart (see: PubObjectsExportPlugin::prepareAndExportPubObjects)
-        $exportPlugin = $this->_getExportPlugin();
-        $filterName = $exportPlugin->getIssueFilter();
         $xmlErrors = [];
-
-        $temporaryFileId = $exportPlugin->exportAsDownload($context, $issues, $filterName, 'issues', null, $xmlErrors);
+        $temporaryFileId = $this->_exportPlugin->exportIssuesAsDownload($context, $issues, null, $xmlErrors);
         return ['temporaryFileId' => $temporaryFileId, 'xmlErrors' => $xmlErrors];
     }
 
@@ -312,11 +301,8 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
      */
     public function depositIssues(array $issues, Context $context): array
     {
-        $exportPlugin = $this->_getExportPlugin();
-        $filterName = $exportPlugin->getIssueFilter();
         $responseMessage = '';
-        $status = $exportPlugin->exportAndDeposit($context, $issues, $filterName, $responseMessage);
-
+        $status = $this->_exportPlugin->exportIssuesAndDeposit($context, $issues, $responseMessage);
         return [
             'hasErrors' => !$status,
             'responseMessage' => $responseMessage
@@ -334,14 +320,12 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
         $editParams = &$args[0];
         $editParams[$this->_getFailedMsgSettingName()] = null;
         $editParams[$this->_getSuccessMsgSettingName()] = null;
-
         return false;
     }
 
     /**
      * Get request failed message setting name.
      * NB: Change from 3.3.x to camelCase (over crossref::failedMsg)
-     *
      */
     private function _getFailedMsgSettingName(): string
     {
@@ -351,34 +335,18 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
     /**
      * Get deposit batch ID setting name.
      * NB: Change from 3.3.x to camelCase (over crossref::batchId)
-     *
      */
     private function _getDepositBatchIdSettingName(): string
     {
         return $this->getName() . '_batchId';
     }
 
+    /**
+     * Get success message setting name.
+     */
     private function _getSuccessMsgSettingName(): string
     {
         return $this->getName() . '_successMsg';
-    }
-
-    /**
-     * @return CrossrefExportPlugin
-     */
-    private function _getExportPlugin()
-    {
-        if (empty($this->_exportPlugin)) {
-            $pluginCategory = 'importexport';
-            $pluginPathName = 'CrossrefExportPlugin';
-            $this->_exportPlugin = PluginRegistry::getPlugin($pluginCategory, $pluginPathName);
-            // If being run from CLI, there is no context, so plugin initialization would not have been fired
-            if ($this->_exportPlugin === null && !isset($_SERVER['SERVER_NAME'])) {
-                $this->_pluginInitialization();
-                $this->_exportPlugin = PluginRegistry::getPlugin($pluginCategory, $pluginPathName);
-            }
-        }
-        return $this->_exportPlugin;
     }
 
     /**
@@ -426,13 +394,27 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
     public function validate(string $hookName, array $args): bool
     {
         $errors = & $args[0];
+        $publication = $args[1];
         $submission = $args[2];
-        $context = Application::getContextDAO()->getById($submission->getData('contextId'));
-        $publication = $submission->getCurrentPublication(); /* @var $publication Publication */
+
         $issueId = $publication->getData('issueId');
-        
+
+        $contextService = app()->get('context');
+        $context = $contextService->get($submission->getData('contextId'));
+        $enabledRegistrationAgency = $context->getConfiguredDoiAgency();
+        $enabledDoiTypes = $context->getData('enabledDoiTypes');
+        $doiCreationTime = $context->getData(Context::SETTING_DOI_CREATION_TIME);
+        if (!($enabledRegistrationAgency instanceof $this) ||
+            !in_array(Repo::doi()::TYPE_PUBLICATION, $enabledDoiTypes) ||
+            $doiCreationTime != Repo::doi()::CREATION_TIME_COPYEDIT) {
+
+                return Hook::CONTINUE;
+        }
+
         $rules = [
-            'onlineIssn' => ['required_without:printIssn', 'string'],
+            'publisherInstitution' => ['required', 'string'],
+            'onlineIssn' => ['required_without:printIssn', 'nullable', 'string'],
+            'printIssn' => ['required_without:onlineIssn', 'nullable', 'string'],
             'doi' => ['required', 'string'],
             'issueId' => [
                 'sometimes',
@@ -450,7 +432,9 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
         ];
 
         $metadata = [
+            'publisherInstitution' => $context->getData('publisherInstitution'),
             'onlineIssn' => $context->getData('onlineIssn'),
+            'printIssn' => $context->getData('printIssn'),
             'doi' => $publication->getDoi(),
             'issueId' => $issueId,
         ];
@@ -481,6 +465,7 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
             ]),
             'onlineIssn.required_without' => __('plugins.generic.crossref.issn.requiredWithout'),
             'printIssn.required_without' => __('plugins.generic.crossref.issn.requiredWithout'),
+            'publisherInstitution.required' => __('plugins.generic.crossref.publisherInstitution.required')
         ];
     }
 
