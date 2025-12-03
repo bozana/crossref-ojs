@@ -26,6 +26,7 @@ use APP\submission\Submission;
 use Exception;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Validator;
+use PKP\citation\Citation;
 use PKP\context\Context;
 use PKP\doi\RegistrationAgencySettings;
 use PKP\plugins\GenericPlugin;
@@ -68,6 +69,9 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
             $this->_exportPlugin = PluginRegistry::getPlugin('importexport', 'CrossrefExportPlugin');
 
             Hook::add('Schema::get::doi', $this->addToSchema(...));
+            Hook::add('Schema::get::submission', [$this, 'addSubmissionSchema']);
+
+            Hook::add('Citation::importCitations::after', [$this, 'citationsChanged']);
 
             if ($this->getEnabled($mainContextId)) {
                 $this->_pluginInitialization();
@@ -109,6 +113,8 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
         Hook::add('Doi::markRegistered', $this->editMarkRegisteredParams(...));
         Hook::add('DoiListPanel::setConfig', $this->addRegistrationAgencyName(...));
         Hook::add('Publication::validatePublish', $this->validate(...));
+
+        Hook::add('Templates::Article::Details::Reference', [$this, 'displayReferenceDOI']);
     }
 
     /**
@@ -135,8 +141,61 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
             ];
         }
 
-        return false;
+        return Hook::CONTINUE;
     }
+
+    /**
+     * Add properties to the submission entity
+     *
+     * @param $hookName string `Schema::get::submission`
+     * @param array $args [
+     *      @option stdClass $schema
+     * ]
+     */
+    public function addSubmissionSchema(string $hookName, array $args): bool
+    {
+        $schema = $args[0];
+
+        $schema->properties->{$this->getCitationsDiagnosticIdSettingName()} = (object) [
+            'type' => 'string',
+            'apiSummary' => true,
+            'validation' => ['nullable']
+        ];
+
+        $schema->properties->{$this->getAutoCheckSettingName()} = (object) [
+            'type' => 'boolean',
+            'apiSummary' => true,
+            'validation' => ['nullable']
+        ];
+        return Hook::CONTINUE;
+    }
+
+    /**
+     * Resets the submission data related to citations DOIs check.
+     * Used every time the citations for a certain publication are imported.
+     *
+     * @param $hookName string 'Citation::importCitations::after'
+     */
+    public function citationsChanged(string $hookName, int $publicationId, array $existingCitations, array $importedCitations): bool
+    {
+        if (!$this->getEnabled() ||
+            !$this->hasCrossrefCredentials() ||
+            !$this->citationsEnabled()) {
+
+                return Hook::CONTINUE;
+        }
+
+        $publication = Repo::publication()->get($publicationId);
+        $submission = Repo::submission()->get($publication->getData('submissionId'));
+
+        if ($submission->getData($this->getCitationsDiagnosticIdSettingName())) {
+            $submission->setData($this->getCitationsDiagnosticIdSettingName(), null);
+            $submission->setData($this->getAutoCheckSettingName(), null);
+            Repo::submission()->edit($submission, []);
+        }
+        return Hook::CONTINUE;
+    }
+
 
     /**
      * Includes plugin in list of configurable registration agencies for DOI depositing functionality
@@ -374,6 +433,23 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
     }
 
     /**
+     * Get citations diagnostic ID setting name.
+     */
+    public function getCitationsDiagnosticIdSettingName(): string
+    {
+        return 'crossref::citationsDiagnosticId';
+    }
+
+    /**
+     * Get setting name, that defines if the scheduled task for the automatic check
+     * of the found Crossref citations DOIs should be run, if set up so in the plugin settings.
+     */
+    public function getAutoCheckSettingName(): string
+    {
+        return 'crossref::checkCitationsDOIs';
+    }
+
+    /**
      * @inheritDoc
      */
     public function getSettingsObject(): RegistrationAgencySettings
@@ -459,6 +535,40 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
     }
 
     /**
+     * Insert reference DOI on the citations and article view page.
+     *
+     * @param string $hookName 'Templates::Article::Details::Reference'
+     * @param $params array [
+     *  @option Citation
+     *  @option Smarty
+     *  @option string Rendered smarty template
+     * ]
+     */
+    public function displayReferenceDOI(string $hookName, array $params): bool
+    {
+        if (!$this->getEnabled() ||
+            !$this->hasCrossrefCredentials() ||
+            !$this->citationsEnabled()) {
+
+                return Hook::CONTINUE;
+        }
+
+        /** @var Citation $citation */
+        $citation = $params[0]['citation'];
+        /** @var \Smarty $smarty */
+        $smarty = &$params[1];
+        /** @var string $output */
+        $output = &$params[2];
+
+        if ($citation->getData('doi')) {
+            $crossrefFullUrl = 'https://doi.org/' . $citation->getData('doi');
+            $smarty->assign('crossrefFullUrl', $crossrefFullUrl);
+            $output .= $smarty->fetch($this->getTemplateResource('displayDOI.tpl'));
+        }
+        return Hook::CONTINUE;
+    }
+
+    /**
      * Get validation messages
      * @throws Exception
      */
@@ -491,5 +601,31 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
             }
         }
         return $values;
+    }
+
+    /**
+     * Are Crossref username and password set
+     */
+    protected function hasCrossrefCredentials(?int $contextId = null): bool
+    {
+        if (!isset($contextId)) {
+            $contextId = $this->getCurrentContextId();
+        }
+        return strlen((string) $this->getSetting($contextId, 'username')) > 0 && strlen((string) $this->getSetting($contextId, 'password')) > 0;
+    }
+
+    /**
+     * Are citations submission metadata enabled in this journal
+     */
+    public function citationsEnabled(?int $contextId = null): bool
+    {
+        if (!isset($contextId)) {
+            $contextId = $this->getCurrentContextId();
+        }
+
+        /** @var ContextService $contextService */
+        $contextService = app()->get('context');
+        $context = $contextService->get($contextId);
+        return !empty($context->getData('citations'));
     }
 }

@@ -25,7 +25,11 @@ use APP\publication\Publication;
 use APP\submission\Submission;
 use DOMDocument;
 use DOMElement;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Enumerable;
+use PKP\citation\Citation;
+use PKP\citation\enum\CitationSourceType;
+use PKP\citation\enum\CitationType;
 use PKP\context\Context;
 use PKP\core\PKPApplication;
 use PKP\db\DAORegistry;
@@ -157,7 +161,7 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
 
         // titles
         $titleLanguages = array_keys($publication->getTitles());
-        // Crossref 5.3.1 limits to 20 titles maximum, ensure the primary locale is first
+        // Crossref 5.4.0 limits to 20 titles maximum, ensure the primary locale is first
         $primaryLanguageIndex = array_search($locale, $titleLanguages);
         if ($primaryLanguageIndex) {
             unset($titleLanguages[$primaryLanguageIndex]);
@@ -298,6 +302,9 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
         $this->appendTextMiningCollectionNodes($doc, $doiDataNode, $publication, $submission, $submissionGalleys);
 
         $journalArticleNode->appendChild($doiDataNode);
+
+
+        $this->appendCitationListNode($doc, $journalArticleNode, $publication);
 
         // component_list (supplementary files)
         if (!empty($componentGalleys)) {
@@ -512,6 +519,116 @@ class ArticleCrossrefXmlFilter extends IssueCrossrefXmlFilter
             }
         }
         $doiDataNode->appendChild($textMiningCollectionNode);
+    }
+
+    /**
+     * Append citation list node.
+     */
+    public function appendCitationListNode(DOMDocument $doc, DOMElement $parentNode, Publication $publication): void
+    {
+        /** @var CrossrefExportDeployment $deployment */
+        $deployment = $this->getDeployment();
+
+        $citations = $publication->getData('citations');
+        if ($citations) {
+            $citationListNode = $doc->createElementNS($deployment->getNamespace(), 'citation_list');
+            foreach ($citations as $citation) {
+                /** @var Citation $citation */
+                $rawCitation = $citation->getRawCitation();
+                $isStructured = $citation->isStructured();
+                if (!empty($rawCitation)) { // This should not be the case any more, but lets leave it here
+                    $citationNode = $doc->createElementNS($deployment->getNamespace(), 'citation');
+                    $citationNode->setAttribute('key', $citation->getId());
+                    if ($isStructured) {
+                        $this->appendStructuredCitationElements($doc, $citationNode, $citation);
+                    } elseif ($citationDoi = $citation->getData('doi')) {
+                        $node = $doc->createElementNS($deployment->getNamespace(), 'doi');
+                        $node->appendChild($doc->createTextNode($citationDoi));
+                        $citationNode->appendChild($node);
+                    } else {
+                        $node = $doc->createElementNS($deployment->getNamespace(), 'unstructured_citation');
+                        $node->appendChild($doc->createTextNode($rawCitation));
+                        $citationNode->appendChild($node);
+                    }
+                    $citationListNode->appendChild($citationNode);
+                }
+            }
+            $parentNode->appendChild($citationListNode);
+        }
+    }
+
+    /**
+     * Append structured citation elements
+     */
+    public function appendStructuredCitationElements(DOMDocument$doc, DOMElement $parentNode, Citation $citation): void
+    {
+        /** @var CrossrefExportDeployment $deployment */
+        $deployment = $this->getDeployment();
+
+        if ($issn = $citation->getData('sourceIssn')) {
+            $issnNode = $doc->createElementNS($deployment->getNamespace(), 'issn', $issn);
+            $parentNode->appendChild($issnNode);
+        }
+        if (($citation->getData('sourceType') == CitationSourceType::JOURNAL->value && $journalTitle = $citation->getData('sourceName')) ||
+            ($citation->getData('type') == CitationSourceType::JOURNAL->value && $journalTitle = $citation->getData('title'))) {
+
+                $journalTitleNode = $doc->createElementNS($deployment->getNamespace(), 'journal_title');
+                $journalTitleNode->appendChild($doc->createTextNode($journalTitle));
+                $parentNode->appendChild($journalTitleNode);
+        }
+        if ($authors = $citation->getData('authors')) {
+            $firstAuthorNames = $authors[0]['givenName'] ? [$authors[0]['givenName']] : [];
+            if ($authors[0]['familyName'] ?? '') {
+                $firstAuthorNames[] = $authors[0]['familyName'];
+            }
+            if (!empty($firstAuthorNames)) {
+                $firstAuthorName = implode(' ', $firstAuthorNames);
+                $authorNode = $doc->createElementNS($deployment->getNamespace(), 'author');
+                $authorNode->appendChild($doc->createTextNode($firstAuthorName));
+                $parentNode->appendChild($authorNode);
+            }
+        }
+        if ($volume = $citation->getData('volume')) {
+            $volumeNode = $doc->createElementNS($deployment->getNamespace(), 'volume', $volume);
+            $parentNode->appendChild($volumeNode);
+        }
+        if ($issue = $citation->getData('issue')) {
+            $issueNode = $doc->createElementNS($deployment->getNamespace(), 'issue', $issue);
+            $parentNode->appendChild($issueNode);
+        }
+        if ($firstPage = $citation->getData('firstPage')) {
+            $firstPageNode = $doc->createElementNS($deployment->getNamespace(), 'first_page', $firstPage);
+            $parentNode->appendChild($firstPageNode);
+        }
+        if ($date = $citation->getData('date')) {
+            $dateParsed = Carbon::parse($date);
+            $cYearNode = $doc->createElementNS($deployment->getNamespace(), 'cYear', $dateParsed->year);
+            $parentNode->appendChild($cYearNode);
+        }
+        if ($doi = $citation->getData('doi')) {
+            $doiNode = $doc->createElementNS($deployment->getNamespace(), 'doi');
+            $doiNode->appendChild($doc->createTextNode($doi));
+            $parentNode->appendChild($doiNode);
+        }
+        if (($citation->getData('sourceType') == CitationSourceType::BOOK_SERIES->value && $seriesTitle = $citation->getData('sourceName')) ||
+            ($citation->getData('type') == CitationType::BOOK_SERIES->value && $seriesTitle = $citation->getData('title'))) {
+
+                $seriesTitleNode = $doc->createElementNS($deployment->getNamespace(), 'series_title');
+                $seriesTitleNode->appendChild($doc->createTextNode($seriesTitle));
+                $parentNode->appendChild($seriesTitleNode);
+        }
+        if (($citation->getData('type') == CitationType::BOOK->value || $citation->getData('type') == CitationType::MONOGRAPH->value) &&
+            $volumeTitle = $citation->getData('title')) {
+
+                $volumeTitleNode = $doc->createElementNS($deployment->getNamespace(), 'volume_title');
+                $volumeTitleNode->appendChild($doc->createTextNode($volumeTitle));
+                $parentNode->appendChild($volumeTitleNode);
+        }
+        if ($citation->getData('type') == CitationType::JOURNAL_ARTICLE->value && $articleTitle = $citation->getData('title')) {
+                $articleTitleNode = $doc->createElementNS($deployment->getNamespace(), 'article_title');
+                $articleTitleNode->appendChild($doc->createTextNode($articleTitle));
+                $parentNode->appendChild($articleTitleNode);
+        }
     }
 
     /**
