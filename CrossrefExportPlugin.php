@@ -373,6 +373,17 @@ class CrossrefExportPlugin extends DOIPubIdExportPlugin
             if ($warningCount > 0) {
                 $result = [['plugins.importexport.crossref.register.success.warning', htmlspecialchars($response->getBody())]];
             }
+
+            if (($objects instanceof Submission) && ($xmlDoc->getElementsByTagName('citations_diagnostic')->length > 0)) {
+                $citationsDiagnosticNode = $xmlDoc->getElementsByTagName('citations_diagnostic')->item(0); /** @var DOMNodeList $citationsDiagnosticNode */
+                $citationsDiagnosticCode = $citationsDiagnosticNode->getAttribute('deferred') ;
+                //set the citations diagnostic code and the setting for the automatic check
+                $objects->setData($this->getCitationsDiagnosticIdSettingName(), $citationsDiagnosticCode);
+                $objects->setData($this->getAutoCheckSettingName(), true);
+                Repo::submission()->edit($objects, []);
+                $objects = Repo::submission()->get($objects->getId());
+            }
+
             // A possibility for other plugins (e.g. reference linking) to work with the response
             Hook::run('crossrefexportplugin::deposited', [[$this, $response->getBody(), $objects]]);
         }
@@ -427,6 +438,25 @@ class CrossrefExportPlugin extends DOIPubIdExportPlugin
     public function getSuccessMsgSettingName(): string
     {
         return $this->getPluginSettingsPrefix() . '_successMsg';
+    }
+
+    /**
+     * Get citations diagnostic ID setting name.
+     */
+    public function getCitationsDiagnosticIdSettingName(): string
+    {
+        return $this->getPluginSettingsPrefix() . '_citationsDiagnosticId';
+        //return 'crossref::citationsDiagnosticId';
+    }
+
+    /**
+     * Get setting name, that defines if the scheduled task for the automatic check
+     * of the found Crossref citations DOIs should be run, if set up so in the plugin settings.
+     */
+    public function getAutoCheckSettingName(): string
+    {
+        return $this->getPluginSettingsPrefix() . '_checkCitationsDOIs';
+        //return 'crossref::checkCitationsDOIs';
     }
 
     /**

@@ -128,9 +128,9 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
         $schema = &$args[0];
 
         $settings = [
-            $this->_getDepositBatchIdSettingName(),
-            $this->_getFailedMsgSettingName(),
-            $this->_getSuccessMsgSettingName(),
+            $this->_exportPlugin->getDepositBatchIdSettingName(),
+            $this->_exportPlugin->getFailedMsgSettingName(),
+            $this->_exportPlugin->getSuccessMsgSettingName(),
         ];
 
         foreach ($settings as $settingName) {
@@ -156,13 +156,13 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
     {
         $schema = $args[0];
 
-        $schema->properties->{$this->getCitationsDiagnosticIdSettingName()} = (object) [
+        $schema->properties->{$this->_exportPlugin->getCitationsDiagnosticIdSettingName()} = (object) [
             'type' => 'string',
             'apiSummary' => true,
             'validation' => ['nullable']
         ];
 
-        $schema->properties->{$this->getAutoCheckSettingName()} = (object) [
+        $schema->properties->{$this->_exportPlugin->getAutoCheckSettingName()} = (object) [
             'type' => 'boolean',
             'apiSummary' => true,
             'validation' => ['nullable']
@@ -188,9 +188,9 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
         $publication = Repo::publication()->get($publicationId);
         $submission = Repo::submission()->get($publication->getData('submissionId'));
 
-        if ($submission->getData($this->getCitationsDiagnosticIdSettingName())) {
-            $submission->setData($this->getCitationsDiagnosticIdSettingName(), null);
-            $submission->setData($this->getAutoCheckSettingName(), null);
+        if ($submission->getData($this->_exportPlugin->getCitationsDiagnosticIdSettingName())) {
+            $submission->setData($this->_exportPlugin->getCitationsDiagnosticIdSettingName(), null);
+            $submission->setData($this->_exportPlugin->getAutoCheckSettingName(), null);
             Repo::submission()->edit($submission, []);
         }
         return Hook::CONTINUE;
@@ -385,35 +385,9 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
     public function editMarkRegisteredParams(string $hookName, array $args): bool
     {
         $editParams = &$args[0];
-        $editParams[$this->_getFailedMsgSettingName()] = null;
-        $editParams[$this->_getSuccessMsgSettingName()] = null;
+        $editParams[$this->_exportPlugin->getFailedMsgSettingName()] = null;
+        $editParams[$this->_exportPlugin->getSuccessMsgSettingName()] = null;
         return false;
-    }
-
-    /**
-     * Get request failed message setting name.
-     * NB: Change from 3.3.x to camelCase (over crossref::failedMsg)
-     */
-    private function _getFailedMsgSettingName(): string
-    {
-        return $this->getName() . '_failedMsg';
-    }
-
-    /**
-     * Get deposit batch ID setting name.
-     * NB: Change from 3.3.x to camelCase (over crossref::batchId)
-     */
-    private function _getDepositBatchIdSettingName(): string
-    {
-        return $this->getName() . '_batchId';
-    }
-
-    /**
-     * Get success message setting name.
-     */
-    private function _getSuccessMsgSettingName(): string
-    {
-        return $this->getName() . '_successMsg';
     }
 
     /**
@@ -421,7 +395,7 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
      */
     public function getErrorMessageKey(): ?string
     {
-        return $this->_getFailedMsgSettingName();
+        return $this->_exportPlugin->getFailedMsgSettingName();
     }
 
     /**
@@ -429,24 +403,7 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
      */
     public function getRegisteredMessageKey(): ?string
     {
-        return $this->_getSuccessMsgSettingName();
-    }
-
-    /**
-     * Get citations diagnostic ID setting name.
-     */
-    public function getCitationsDiagnosticIdSettingName(): string
-    {
-        return 'crossref::citationsDiagnosticId';
-    }
-
-    /**
-     * Get setting name, that defines if the scheduled task for the automatic check
-     * of the found Crossref citations DOIs should be run, if set up so in the plugin settings.
-     */
-    public function getAutoCheckSettingName(): string
-    {
-        return 'crossref::checkCitationsDOIs';
+        return $this->_exportPlugin->getSuccessMsgSettingName();
     }
 
     /**
@@ -467,6 +424,132 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
     public function getAllowedDoiTypes(): array
     {
         return [Repo::doi()::TYPE_PUBLICATION, Repo::doi()::TYPE_ISSUE];
+    }
+
+    /**
+     * Retrieve all submissions that should be automatically checked for the found Crossref citations DOIs.
+     *
+     * @return Submission[]
+     */
+    public function getSubmissionsToCheck(Context $context): array
+    {
+        $submissionIds = Repo::submission()->getIdsBySetting($this->_exportPlugin->getAutoCheckSettingName(), true, $context->getId())->toArray();
+        $submissions = Repo::submission()->getCollector()->filterBySubmissionIds($submissionIds)->getMany()->all();
+        return $submissions;
+    }
+
+    /**
+     * Get found Crossref references DOIs for the given publication DOI.
+     */
+    public function considerFoundCrossrefReferencesDOIs(Publication $publication): void
+    {
+        $doi = urlencode($publication->getDoi());
+        if (empty($doi)) {
+            return;
+        }
+
+        $citationsToCheck = collect($publication->getData('citations'))
+            ->filter(fn ($citation) => !$citation->getData('doi'))
+            ->map(fn ($citation) => [$citation->getId() => $citation]);
+        /*
+        $citationsToCheck = [];
+        foreach ($citations as $citation) {
+            if (!$citation->getData('doi')) {
+                $citationsToCheck[$citation->getId()] = $citation;
+            }
+        }
+        */
+        if (empty($citationsToCheck)) {
+            return;
+        }
+
+        $citationsToCheckKeys = $citationsToCheck->keys()->all();
+
+        $submission = Repo::submission()->get($publication->getData('submissionId'));
+
+        $matchedReferences = $this->getResolvedRefs($doi, $submission->getData('contextId'));
+        if ($matchedReferences) {
+            $filteredMatchedReferences = array_filter(
+                $matchedReferences,
+                fn ($value) => in_array($value['key'], $citationsToCheckKeys)
+            );
+
+            foreach ($filteredMatchedReferences as $matchedReference) {
+                $citation = $citationsToCheck[$matchedReference['key']];
+                $citation->setData($this->getCitationDoiSettingName(), $matchedReference['doi']);
+                $citationDao->updateObject($citation);
+            }
+
+            // remove auto check setting
+            $submission->setData($this->getAutoCheckSettingName(), null);
+            Repo::submission()->edit($submission, []);
+        }
+    }
+    
+    /**
+     * Use Crossref API to get the references DOIs for the the given article DOI.
+     */
+    protected function getResolvedRefs(string $doi, int $contextId): ?array
+    {
+        $matchedReferences = null;
+
+        PluginRegistry::loadCategory('generic'); // This is maybe not needed in 3.6 if we take care that generic plugins are always loaded
+        $crossrefPlugin = PluginRegistry::getPlugin('generic', 'crossrefplugin');
+        $username = $crossrefPlugin->getSetting($contextId, 'username');
+        $password = $crossrefPlugin->getSetting($contextId, 'password');
+
+        // Use a different endpoint for testing and production.
+        $isTestMode = $crossrefPlugin->getSetting($contextId, 'testMode') == 1;
+        $endpoint = ($isTestMode ? self::CROSSREF_API_REFS_URL_DEV : self::CROSSREF_API_REFS_URL);
+
+        $url = $endpoint . '?doi=' . $doi . '&usr=' . $username . '&pwd=' . $password;
+
+        $httpClient = Application::get()->getHttpClient();
+        try {
+            $response = $httpClient->request('POST', $url);
+        } catch (\GuzzleHttp\Exception\RequestException $e) {
+            return null;
+        }
+
+        if ($response?->getStatusCode() == 200) {
+            $response = json_decode($response->getBody(), true);
+            $matchedReferences = $response['matched-references'];
+        }
+
+        return $matchedReferences;
+    }
+    /**
+     * Insert reference DOI on the citations and article view page.
+     *
+     * @param string $hookName 'Templates::Article::Details::Reference'
+     * @param $params array [
+     *  @option Citation
+     *  @option Smarty
+     *  @option string Rendered smarty template
+     * ]
+     */
+    public function displayReferenceDOI(string $hookName, array $params): bool
+    {
+        if (!$this->getEnabled() ||
+            !$this->hasCrossrefCredentials() ||
+            !$this->citationsEnabled()) {
+
+                return Hook::CONTINUE;
+        }
+
+        /** @var Citation $citation */
+        $citation = $params[0]['citation'];
+        /** @var \Smarty $smarty */
+        $smarty = &$params[1];
+        /** @var string $output */
+        $output = &$params[2];
+
+        if ($citation->getData('doi')) {
+            $crossrefFullUrl = 'https://doi.org/' . $citation->getData('doi');
+            $smarty->assign('crossrefFullUrl', $crossrefFullUrl);
+            $output .= $smarty->fetch($this->getTemplateResource('displayDOI.tpl'));
+        }
+        return Hook::CONTINUE;
     }
 
     /**
@@ -532,40 +615,6 @@ class CrossrefPlugin extends GenericPlugin implements IDoiRegistrationAgency
             $errors = $this->formatErrors($validator->errors()->toArray());
         }
         return HOOK::CONTINUE;
-    }
-
-    /**
-     * Insert reference DOI on the citations and article view page.
-     *
-     * @param string $hookName 'Templates::Article::Details::Reference'
-     * @param $params array [
-     *  @option Citation
-     *  @option Smarty
-     *  @option string Rendered smarty template
-     * ]
-     */
-    public function displayReferenceDOI(string $hookName, array $params): bool
-    {
-        if (!$this->getEnabled() ||
-            !$this->hasCrossrefCredentials() ||
-            !$this->citationsEnabled()) {
-
-                return Hook::CONTINUE;
-        }
-
-        /** @var Citation $citation */
-        $citation = $params[0]['citation'];
-        /** @var \Smarty $smarty */
-        $smarty = &$params[1];
-        /** @var string $output */
-        $output = &$params[2];
-
-        if ($citation->getData('doi')) {
-            $crossrefFullUrl = 'https://doi.org/' . $citation->getData('doi');
-            $smarty->assign('crossrefFullUrl', $crossrefFullUrl);
-            $output .= $smarty->fetch($this->getTemplateResource('displayDOI.tpl'));
-        }
-        return Hook::CONTINUE;
     }
 
     /**
